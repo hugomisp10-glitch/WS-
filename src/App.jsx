@@ -38,20 +38,6 @@ const FALLBACK_ITEMS = [
   },
 ];
 
-const SYSTEM_PROMPT = `És um agregador de notícias financeiras. Pesquisa na web pelas notícias mais importantes e recentes sobre as bolsas dos EUA (Wall Street, S&P 500, Nasdaq, Dow Jones). Faz VÁRIAS pesquisas com termos diferentes (ex: "stock market news today", "Wall Street today", "S&P 500 today", "Fed news", "earnings this week", "IPO news") para garantires boa cobertura, em vez de te limitares a uma única pesquisa. Usa como fontes: Bloomberg, CNBC, Reuters, Yahoo Finance, MarketWatch, Wall Street Journal, Seeking Alpha, Barron's, Investing.com, Business Insider, Motley Fool, Benzinga, Axios e Fortune — usa qualquer uma delas que aparecer nos resultados, não te limites às primeiras.
-
-Devolve APENAS um array JSON puro (sem markdown, sem \`\`\`, sem texto antes ou depois), com EXATAMENTE 8 itens — nem mais, nem menos, para garantires que consegues terminar a resposta — cada um com exatamente estes campos:
-- "category": um destes valores exatos -> "macro" (Fed/taxas/inflação/macroeconomia), "earnings" (resultados empresariais), "ipo" (IPOs e fusões/aquisições), "tech" (tecnologia e IA), "indices" (índices e ações em destaque), "regulacao" (regulação e política)
-- "title": título curto em português de Portugal, factual, sem sensacionalismo (máximo 12 palavras)
-- "summary": 1 frase curta em português de Portugal, no máximo 18 palavras
-- "source": nome do meio de comunicação de onde veio a notícia
-- "time": indicação temporal curta (ex: "há 3h", "hoje", "21 ago")
-- "url": o link direto e exato para o artigo original, tal como aparece nos resultados de pesquisa (nunca inventes um link — se não tiveres a certeza do URL exato, usa string vazia "")
-- "companies": array com no máximo 3 nomes de empresas/tickers relevantes (pode ser vazio)
-- "themes": array com 1 a 2 temas curtos em português (ex: "Fed", "IA", "Earnings")
-
-Sê conciso em todos os campos de texto — a resposta tem de caber num orçamento curto de tokens. Prioriza diversidade entre as 6 categorias em vez de concentrar tudo numa só. Não inventes números ou factos — só reporta o que encontrares nas pesquisas. Termina sempre o array corretamente fechado com "]".`;
-
 function slugify(str) {
   return (str || "item")
     .toLowerCase()
@@ -59,39 +45,6 @@ function slugify(str) {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .slice(0, 40);
-}
-
-// Tenta reparar um array JSON que possa ter ficado cortado a meio
-// (ex: resposta truncada por limite de tokens), aproveitando os
-// objetos que já ficaram completos.
-function repairJsonArray(raw) {
-  let depth = 0;
-  let lastGoodIndex = -1;
-  let inString = false;
-  let escapeNext = false;
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    if (escapeNext) {
-      escapeNext = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escapeNext = true;
-      continue;
-    }
-    if (ch === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (ch === "{") depth++;
-    if (ch === "}") {
-      depth--;
-      if (depth === 0) lastGoodIndex = i;
-    }
-  }
-  if (lastGoodIndex === -1) return null;
-  return raw.slice(0, lastGoodIndex + 1) + "]";
 }
 
 function todayKey() {
@@ -110,104 +63,31 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString("pt-PT");
 }
 
-function buildCompanySystemPrompt(term) {
-  return `És um agregador de notícias financeiras. Pesquisa na web pelas notícias mais recentes e relevantes sobre "${term}" (empresa cotada nos EUA) — resultados, ações, analistas, movimentos do título, negócios, produtos, litígios, etc. Faz VÁRIAS pesquisas com termos diferentes para maximizar a cobertura, por exemplo: "${term} stock news", "${term} stock price", "${term} earnings", "${term} analyst rating", "${term} news this week" — não te limites a uma única pesquisa, mesmo que as primeiras não devolvam muito. Usa qualquer uma destas fontes que aparecer nos resultados: Bloomberg, CNBC, Reuters, Yahoo Finance, MarketWatch, Wall Street Journal, Seeking Alpha, Barron's, Investing.com, Business Insider, Motley Fool, Benzinga, Axios, Fortune, TechCrunch, TheStreet.
-
-Alarga a janela temporal aos últimos 14 dias se não encontrares notícias apenas de hoje — não deixes o resultado vazio só porque não há nada nas últimas 24h.
-
-Devolve APENAS um array JSON puro (sem markdown, sem \`\`\`, sem texto antes ou depois), com até 8 itens sobre "${term}" (o máximo que conseguires encontrar de genuinamente relevante, mínimo 1), cada um com exatamente estes campos:
-- "category": um destes valores exatos -> "macro", "earnings", "ipo", "tech", "indices", "regulacao" (o que melhor descrever a notícia)
-- "title": título curto em português de Portugal, factual (máximo 12 palavras)
-- "summary": 1 frase curta em português de Portugal, no máximo 18 palavras
-- "source": nome do meio de comunicação de onde veio a notícia
-- "time": indicação temporal curta (ex: "há 3h", "hoje", "21 ago")
-- "url": o link direto e exato para o artigo original, tal como aparece nos resultados de pesquisa (nunca inventes um link — se não tiveres a certeza do URL exato, usa string vazia "")
-- "companies": array com no máximo 3 nomes de empresas/tickers relevantes, incluindo sempre "${term}"
-- "themes": array com 1 a 2 temas curtos em português
-
-Se, mesmo depois de várias pesquisas com termos diferentes, não encontrares NADA sobre "${term}", devolve um array vazio []. Nunca inventes notícias, factos ou links. Sê conciso — a resposta tem de caber num orçamento curto de tokens. Termina sempre o array corretamente fechado com "]".`;
-}
-
-// Faz o parsing (com reparo automático) de uma resposta de texto que
-// deve conter um array JSON de notícias, e normaliza os campos.
-function parseNewsResponse(data) {
-  if (data && data.type === "error") {
-    throw new Error(`API error — ${data.error?.message || "desconhecido"}`);
-  }
-
-  const textBlocks = (data.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n");
-
-  if (!textBlocks.trim()) {
-    throw new Error(
-      `Sem texto na resposta (stop_reason: ${data.stop_reason || "?"}, blocos: ${(data.content || [])
-        .map((b) => b.type)
-        .join(",")})`
-    );
-  }
-
-  const cleaned = textBlocks.replace(/```json|```/g, "").trim();
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-  const jsonStr = start === -1 ? null : cleaned.slice(start, end === -1 ? undefined : end + 1);
-
-  let parsed = null;
-  if (jsonStr) {
-    try {
-      parsed = JSON.parse(jsonStr);
-    } catch (parseErr) {
-      const repaired = repairJsonArray(cleaned.slice(start));
-      if (repaired) {
-        try {
-          parsed = JSON.parse(repaired);
-        } catch (e2) {
-          throw new Error(`JSON inválido mesmo após reparo: ${e2.message}`);
-        }
-      } else {
-        throw new Error(`JSON inválido: ${parseErr.message}`);
-      }
-    }
-  } else {
-    throw new Error(`Resposta sem array JSON. Início do texto: "${cleaned.slice(0, 120)}"`);
-  }
-
-  return parsed
-    .filter((it) => it && it.title)
-    .map((it, idx) => ({
-      id: `${slugify(it.title)}-${idx}-${Date.now().toString(36)}`,
-      category: CATEGORY_IDS.includes(it.category) ? it.category : "indices",
-      title: String(it.title),
-      summary: String(it.summary || ""),
-      source: String(it.source || "Fonte desconhecida"),
-      time: String(it.time || ""),
-      url: typeof it.url === "string" && it.url.startsWith("http") ? it.url : "",
-      companies: Array.isArray(it.companies) ? it.companies.slice(0, 6) : [],
-      themes: Array.isArray(it.themes) ? it.themes.slice(0, 4) : [],
-    }))
-    .slice(0, 16);
-}
-
-async function callNewsApi(systemPrompt, userMessage) {
-  const response = await fetch("/api/news", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ systemPrompt, userMessage }),
-  });
-
+// Vai buscar o resumo diário (sem parâmetros) ou notícias de uma empresa
+// específica (?company=termo) à função serverless /api/news, que por sua vez
+// lê feeds RSS públicos e gratuitos (Google News) — sem chave de API nem
+// custos associados.
+async function fetchNewsFromApi(companyTerm) {
+  const url = companyTerm
+    ? `/api/news?company=${encodeURIComponent(companyTerm)}`
+    : "/api/news";
+  const response = await fetch(url);
   if (!response.ok) {
     const bodyText = await response.text().catch(() => "");
     throw new Error(`HTTP ${response.status} — ${bodyText.slice(0, 200)}`);
   }
-  return response.json();
+  const data = await response.json();
+  if (data.error) throw new Error(data.error);
+  return Array.isArray(data.items) ? data.items : [];
 }
 
+const SNAPSHOT_KEY = "wsd-snapshot";
+const BOOKMARK_KEY = "wsd-bookmarks";
+
 // ---------------------------------------------------------------------------
-// Armazenamento local no telemóvel/browser (localStorage). Substitui o
-// window.storage disponível apenas dentro de artifacts do Claude — aqui os
-// dados ficam guardados diretamente no dispositivo onde a app corre (persiste
-// entre sessões, incluindo quando adicionada ao ecrã principal como PWA).
+// Armazenamento local no telemóvel/browser (localStorage). Os dados ficam
+// guardados diretamente no dispositivo onde a app corre (persiste entre
+// sessões, incluindo quando adicionada ao ecrã principal como PWA).
 // ---------------------------------------------------------------------------
 const storage = {
   async get(key) {
@@ -230,6 +110,7 @@ const storage = {
   },
 };
 
+
 export default function WallStreetDesk() {
   const [items, setItems] = useState(FALLBACK_ITEMS);
   const [loading, setLoading] = useState(true);
@@ -251,11 +132,7 @@ export default function WallStreetDesk() {
     setLoading(true);
     setError(null);
     try {
-      const data = await callNewsApi(
-        SYSTEM_PROMPT,
-        "Gera agora o snapshot das notícias mais recentes sobre as bolsas dos EUA."
-      );
-      const normalized = parseNewsResponse(data);
+      const normalized = await fetchNewsFromApi();
       if (normalized.length === 0) throw new Error("Sem itens no resultado");
 
       const nowIso = new Date().toISOString();
@@ -289,11 +166,7 @@ export default function WallStreetDesk() {
     setCompanyError(null);
     setCompanySearchTerm(clean);
     try {
-      const data = await callNewsApi(
-        buildCompanySystemPrompt(clean),
-        `Procura notícias recentes sobre "${clean}".`
-      );
-      const normalized = parseNewsResponse(data);
+      const normalized = await fetchNewsFromApi(clean);
       if (normalized.length === 0) {
         setCompanyError(`Não foram encontradas notícias recentes sobre "${clean}". Tenta o nome completo da empresa ou o ticker (ex: "Microsoft" ou "MSFT").`);
         setCompanyResults(null);
@@ -864,9 +737,10 @@ export default function WallStreetDesk() {
         <div className="wsd-eyebrow">Resumo diário · Bolsas dos EUA</div>
         <h1 className="wsd-title">Wall Street Desk</h1>
         <p className="wsd-subtitle">
-          Sempre que abres a app, é feita uma pesquisa em direto nos principais sites de
-          bolsa — Bloomberg, CNBC, Reuters, Yahoo Finance, MarketWatch, Wall Street
-          Journal e Seeking Alpha — e o resumo é organizado por tipologia de notícia.
+          Sempre que abres a app, é feita uma pesquisa em direto em fontes gratuitas de
+          notícias (Google News, agregando Bloomberg, CNBC, Reuters, Yahoo Finance,
+          MarketWatch, WSJ e outras) — sem custos nem chave de API. Toca num título
+          para abrir a notícia completa na fonte original.
         </p>
 
         <div className="wsd-status-row">
@@ -1036,7 +910,7 @@ export default function WallStreetDesk() {
                           <Star size={17} fill={bookmarks.includes(item.id) ? "#D4A24C" : "none"} />
                         </button>
                       </div>
-                      <p className="wsd-card-summary">{item.summary}</p>
+                      {item.summary && <p className="wsd-card-summary">{item.summary}</p>}
                       <div className="wsd-card-tags">
                         {(item.companies || []).map((c) => (
                           <span className="wsd-tag company" key={c}>{c}</span>
@@ -1057,7 +931,7 @@ export default function WallStreetDesk() {
                       )}
                       <div className="wsd-card-meta">
                         <span>{item.source}</span>
-                        <span>{item.time}</span>
+                        <span>{timeAgo(item.time)}</span>
                       </div>
                     </article>
                   );
@@ -1098,7 +972,7 @@ export default function WallStreetDesk() {
                         <Star size={17} fill={bookmarks.includes(item.id) ? "#D4A24C" : "none"} />
                       </button>
                     </div>
-                    <p className="wsd-card-summary">{item.summary}</p>
+                    {item.summary && <p className="wsd-card-summary">{item.summary}</p>}
                     <div className="wsd-card-tags">
                       {(item.companies || []).map((c) => (
                         <span className="wsd-tag company" key={c}>{c}</span>
@@ -1119,7 +993,7 @@ export default function WallStreetDesk() {
                     )}
                     <div className="wsd-card-meta">
                       <span>{item.source}</span>
-                      <span>{item.time}</span>
+                      <span>{timeAgo(item.time)}</span>
                     </div>
                   </article>
                 ))}
@@ -1130,10 +1004,10 @@ export default function WallStreetDesk() {
       </main>
 
       <footer className="wsd-footer">
-        Snapshot gerado por pesquisa em direto na web, informativo — não constitui
-        aconselhamento financeiro. Confirma sempre os factos importantes na fonte
-        original antes de tomar decisões. As notícias guardadas (★) e o cache diário
-        ficam gravados neste dispositivo.
+        Manchetes agregadas a partir de fontes públicas e gratuitas — informativo, não
+        constitui aconselhamento financeiro. Toca em "Ler notícia completa" para ver o
+        artigo na fonte original. As notícias guardadas (★) e o cache diário ficam
+        gravados neste dispositivo.
       </footer>
     </div>
   );
